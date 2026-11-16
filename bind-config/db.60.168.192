@@ -1,0 +1,19 @@
+; Strefa odwrotna 60.168.192.in-addr.arpa (sieć 192.168.60.0/24)
+;
+; UWAGA: przy KAŻDEJ zmianie tego pliku należy zwiększyć numer seryjny (Serial)!
+$TTL 300
+@   IN  SOA ns1.zorychta.lan. admin.zorychta.lan. (
+            2026111501 ; Serial
+            3600       ; Refresh
+            600        ; Retry
+            604800     ; Expire
+            60 )       ; Negative Cache TTL
+;
+@                   IN  NS      ns1.zorychta.lan.
+;
+; Ostatni oktet adresu IP -> nazwa hosta
+10	IN  PTR     jenkins.zorychta.lan.
+11	IN  PTR     agent.zorychta.lan.
+12	IN  PTR     test.zorychta.lan.
+13	IN  PTR     prod.zorychta.lan.
+14	IN  PTR     agh.zorychta.lan.
