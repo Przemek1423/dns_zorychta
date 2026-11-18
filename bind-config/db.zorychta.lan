@@ -9,7 +9,7 @@
 ; który przechowuje odpowiedzi w swojej pamięci podręcznej.
 $TTL 300
 @   IN  SOA ns1.zorychta.lan. admin.zorychta.lan. (
-            2026111501 ; Serial
+            2026111801 ; Serial
             3600       ; Refresh
             600        ; Retry
             604800     ; Expire
