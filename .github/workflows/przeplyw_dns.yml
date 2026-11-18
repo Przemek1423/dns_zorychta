@@ -1,0 +1,195 @@
+name: DNS - CI/CD ZorychtaNet
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*.*.*'
+    paths:
+      - 'bind-config/**'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'docker-compose.yml'
+      - '.github/workflows/**'
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Unikalny tag istniejącego obrazu Docker Hub'
+        required: true
+        type: string
+
+      target_environment:
+        description: 'Środowisko docelowe'
+        required: true
+        type: choice
+        options:
+          - Testowe
+          - Produkcyjne
+
+  schedule:
+    - cron: '23 2 * * 1'
+
+jobs:
+  testy-binda:
+    if: github.event_name != 'workflow_dispatch'
+    name: "BIND - ${{ matrix.test_name }}"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test_name: "Konfiguracja BIND"
+            command: "named-checkconf /etc/bind/named.conf"
+
+          - test_name: "Strefa zorychta.lan"
+            command: "named-checkzone zorychta.lan /etc/bind/db.zorychta.lan"
+
+          - test_name: "Strefa odwrotna"
+            command: "named-checkzone 60.168.192.in-addr.arpa /etc/bind/db.60.168.192"
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@v7
+
+      - name: Budowanie obrazu testowego
+        run: docker build -t dns-ci:${{ github.sha }} .
+
+      - name: Walidacja konfiguracji lub strefy
+        run: docker run --rm dns-ci:${{ github.sha }} ${{ matrix.command }}
+
+  kontrola-soa:
+    name: Kontrola numerow SOA
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch'
+
+    steps:
+      - name: Pobranie repozytorium z historia Git
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Porownanie numerow seryjnych SOA
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          event = os.environ["EVENT_NAME"]
+          ref = os.environ["EVENT_REF"]
+
+          if event == "pull_request":
+              base = os.environ["PR_BASE_SHA"]
+
+          elif event == "push":
+              if ref.startswith("refs/tags/"):
+                  print("Tag Git - kontrola SOA pominięta.")
+                  sys.exit(0)
+
+              base = os.environ.get("PUSH_BEFORE", "")
+
+              if not base or set(base) == {"0"}:
+                  print("Pierwszy push nowej gałęzi - kontrola SOA pominięta.")
+                  sys.exit(0)
+
+          else:
+              print(f"Zdarzenie {event} - kontrola SOA pominięta.")
+              sys.exit(0)
+
+          head = os.environ["HEAD_SHA"]
+
+          zones = [
+              "bind-config/db.zorychta.lan",
+              "bind-config/db.60.168.192",
+          ]
+
+          def get_serial(content, filename):
+              match = re.search(
+                  r"\bSOA\b.*?\(\s*(\d+)",
+                  content,
+                  re.IGNORECASE | re.DOTALL
+              )
+
+              if not match:
+                  raise ValueError(
+                      f"Nie znaleziono numeru SOA w {filename}"
+                  )
+
+              return int(match.group(1))
+
+          errors = 0
+
+          for filename in zones:
+              diff = subprocess.run(
+                  ["git", "diff", "--quiet", base, head, "--", filename]
+              )
+
+              if diff.returncode == 0:
+                  print(f"{filename}: bez zmian - pomijam.")
+                  continue
+
+              if diff.returncode != 1:
+                  sys.exit("Błąd podczas sprawdzania zmian Git.")
+
+              old = subprocess.run(
+                  ["git", "show", f"{base}:{filename}"],
+                  capture_output=True,
+                  text=True
+              )
+
+              if old.returncode != 0:
+                  print(f"{filename}: nowa strefa - pomijam porównanie.")
+                  continue
+
+              path = Path(filename)
+
+              if not path.is_file():
+                  sys.exit(f"BŁĄD: plik {filename} nie istnieje.")
+
+              old_serial = get_serial(old.stdout, filename)
+              new_serial = get_serial(path.read_text(encoding="utf-8"), filename)
+
+              print(f"Strefa: {filename}")
+              print(f"Poprzedni SOA: {old_serial}")
+              print(f"Aktualny SOA:  {new_serial}")
+
+              if new_serial <= old_serial:
+                  print("BŁĄD: numer SOA nie został zwiększony!")
+                  errors += 1
+              else:
+                  print("OK: numer SOA został zwiększony.")
+
+          if errors:
+              sys.exit(1)
+
+          print("Kontrola SOA zakończona poprawnie.")
+          PY
+
+  analiza-dockerfile:
+    name: Analiza Dockerfile (Hadolint)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch'
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@v7
+
+      - name: Analiza pliku Dockerfile
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: Dockerfile
