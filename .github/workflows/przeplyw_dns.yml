@@ -274,3 +274,212 @@ jobs:
           cache-to: ${{ github.event_name != 'schedule' && 'type=gha,mode=max' || '' }}
           no-cache: ${{ github.event_name == 'schedule' }}
           pull: ${{ github.event_name == 'schedule' }}
+
+  deploy-test:
+    name: Wdrozenie i test DNS na TEST
+    needs:
+      - build-and-publish
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: test_zorychta
+    environment: Testowe
+    concurrency:
+      group: dns-deploy-test
+      cancel-in-progress: false
+    timeout-minutes: 15
+    env:
+      OBRAZ: ${{ vars.Login_Docker_Hub }}/dns_zorychta
+      TAG: ${{ needs.build-and-publish.outputs.image_tag }}
+      DNS_SERVER_IP: ${{ vars.DNS_SERVER_IP }}
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@v7
+
+      - name: Weryfikacja danych wdrozenia
+        run: |
+          set -euo pipefail
+          test -n "${OBRAZ}" || { echo "::error::Brak nazwy obrazu."; exit 1; }
+          test -n "${TAG}" || { echo "::error::Brak unikalnego tagu z build-and-publish.outputs."; exit 1; }
+          test -n "${DNS_SERVER_IP}" || { echo "::error::Brak DNS_SERVER_IP w srodowisku Testowe."; exit 1; }
+          echo "Srodowisko: TEST"
+          echo "Wdrazany obraz: ${OBRAZ}:${TAG}"
+          echo "Serwer DNS do testow: ${DNS_SERVER_IP}"
+
+      - name: Pobranie obrazu i odtworzenie kontenera
+        run: |
+          set -euo pipefail
+          docker compose --project-name dns_zorychta pull
+          docker compose --project-name dns_zorychta up -d --force-recreate
+          docker compose --project-name dns_zorychta ps
+
+      - name: Test rekordow A, PTR i numeru SOA
+        run: |
+          set -euo pipefail
+
+          echo "Sprawdzanie rekordu A www.zorychta.lan..."
+          A_RESULT=""
+          for attempt in $(seq 1 10); do
+            A_RESULT="$(dig "@${DNS_SERVER_IP}" www.zorychta.lan A +short +time=2 +tries=1 || true)"
+            if [ -n "${A_RESULT}" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Wynik A: ${A_RESULT}"
+          printf '%s\n' "${A_RESULT}" | grep -Fxq '192.168.60.13' || {
+            echo "::error::Rekord A www.zorychta.lan nie wskazuje na PROD (192.168.60.13)."
+            exit 1
+          }
+
+          echo "Sprawdzanie rekordu PTR dla 192.168.60.13..."
+          PTR_RESULT=""
+          for attempt in $(seq 1 10); do
+            PTR_RESULT="$(dig "@${DNS_SERVER_IP}" -x 192.168.60.13 +short +time=2 +tries=1 | sed 's/\.$//' || true)"
+            if [ -n "${PTR_RESULT}" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Wynik PTR: ${PTR_RESULT}"
+          [ "${PTR_RESULT}" = 'prod.zorychta.lan' ] || {
+            echo "::error::Rekord PTR dla 192.168.60.13 nie wskazuje na prod.zorychta.lan."
+            exit 1
+          }
+
+          echo "Odczyt oczekiwanego numeru SOA z pliku strefy w repozytorium..."
+          EXPECTED_SOA="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          zone_file = Path('bind-config/db.zorychta.lan')
+          content = zone_file.read_text(encoding='utf-8')
+          match = re.search(r'\bSOA\b.*?\(\s*(\d+)', content, re.IGNORECASE | re.DOTALL)
+          if not match:
+              raise SystemExit(f'Nie znaleziono numeru SOA w {zone_file}')
+          print(match.group(1))
+          PY
+          )"
+
+          ACTUAL_SOA=""
+          for attempt in $(seq 1 10); do
+            ACTUAL_SOA="$(dig "@${DNS_SERVER_IP}" zorychta.lan SOA +short +time=2 +tries=1 | awk 'NR == 1 {print $3}' || true)"
+            if [ -n "${ACTUAL_SOA}" ]; then
+              break
+            fi
+            sleep 3
+          done
+
+          echo "Oczekiwany SOA: ${EXPECTED_SOA}"
+          echo "Odczytany SOA:  ${ACTUAL_SOA}"
+          [ "${ACTUAL_SOA}" = "${EXPECTED_SOA}" ] || {
+            echo "::error::Numer SOA w dzialajacym DNS nie zgadza sie z plikiem strefy z wdrazanego obrazu."
+            exit 1
+          }
+
+          echo "Test TEST zakonczony poprawnie dla obrazu ${OBRAZ}:${TAG}."
+
+  deploy-prod:
+    name: Wdrozenie i test DNS na PROD
+    needs:
+      - build-and-publish
+      - deploy-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: prod_zorychta
+    environment: Produkcyjne
+    concurrency:
+      group: dns-deploy-prod
+      cancel-in-progress: false
+    timeout-minutes: 15
+    env:
+      OBRAZ: ${{ vars.Login_Docker_Hub }}/dns_zorychta
+      TAG: ${{ needs.build-and-publish.outputs.image_tag }}
+      DNS_SERVER_IP: ${{ vars.DNS_SERVER_IP }}
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@v7
+
+      - name: Weryfikacja danych wdrozenia
+        run: |
+          set -euo pipefail
+          test -n "${OBRAZ}" || { echo "::error::Brak nazwy obrazu."; exit 1; }
+          test -n "${TAG}" || { echo "::error::Brak unikalnego tagu z build-and-publish.outputs."; exit 1; }
+          test -n "${DNS_SERVER_IP}" || { echo "::error::Brak DNS_SERVER_IP w srodowisku Produkcyjne."; exit 1; }
+          echo "Srodowisko: PROD"
+          echo "Wdrazy ten sam obraz, ktory przeszedl test na TEST: ${OBRAZ}:${TAG}"
+          echo "Serwer DNS do testow: ${DNS_SERVER_IP}"
+
+      - name: Pobranie obrazu i odtworzenie kontenera
+        run: |
+          set -euo pipefail
+          docker compose --project-name dns_zorychta pull
+          docker compose --project-name dns_zorychta up -d --force-recreate
+          docker compose --project-name dns_zorychta ps
+
+      - name: Test rekordow A, PTR i numeru SOA
+        run: |
+          set -euo pipefail
+
+          echo "Sprawdzanie rekordu A www.zorychta.lan..."
+          A_RESULT=""
+          for attempt in $(seq 1 10); do
+            A_RESULT="$(dig "@${DNS_SERVER_IP}" www.zorychta.lan A +short +time=2 +tries=1 || true)"
+            if [ -n "${A_RESULT}" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Wynik A: ${A_RESULT}"
+          printf '%s\n' "${A_RESULT}" | grep -Fxq '192.168.60.13' || {
+            echo "::error::Rekord A www.zorychta.lan nie wskazuje na PROD (192.168.60.13)."
+            exit 1
+          }
+
+          echo "Sprawdzanie rekordu PTR dla 192.168.60.13..."
+          PTR_RESULT=""
+          for attempt in $(seq 1 10); do
+            PTR_RESULT="$(dig "@${DNS_SERVER_IP}" -x 192.168.60.13 +short +time=2 +tries=1 | sed 's/\.$//' || true)"
+            if [ -n "${PTR_RESULT}" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Wynik PTR: ${PTR_RESULT}"
+          [ "${PTR_RESULT}" = 'prod.zorychta.lan' ] || {
+            echo "::error::Rekord PTR dla 192.168.60.13 nie wskazuje na prod.zorychta.lan."
+            exit 1
+          }
+
+          echo "Odczyt oczekiwanego numeru SOA z pliku strefy w repozytorium..."
+          EXPECTED_SOA="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          zone_file = Path('bind-config/db.zorychta.lan')
+          content = zone_file.read_text(encoding='utf-8')
+          match = re.search(r'\bSOA\b.*?\(\s*(\d+)', content, re.IGNORECASE | re.DOTALL)
+          if not match:
+              raise SystemExit(f'Nie znaleziono numeru SOA w {zone_file}')
+          print(match.group(1))
+          PY
+          )"
+
+          ACTUAL_SOA=""
+          for attempt in $(seq 1 10); do
+            ACTUAL_SOA="$(dig "@${DNS_SERVER_IP}" zorychta.lan SOA +short +time=2 +tries=1 | awk 'NR == 1 {print $3}' || true)"
+            if [ -n "${ACTUAL_SOA}" ]; then
+              break
+            fi
+            sleep 3
+          done
+
+          echo "Oczekiwany SOA: ${EXPECTED_SOA}"
+          echo "Odczytany SOA:  ${ACTUAL_SOA}"
+          [ "${ACTUAL_SOA}" = "${EXPECTED_SOA}" ] || {
+            echo "::error::Numer SOA w dzialajacym DNS nie zgadza sie z plikiem strefy z wdrazanego obrazu."
+            exit 1
+          }
+
+          echo "Test PROD zakonczony poprawnie dla obrazu ${OBRAZ}:${TAG}."
