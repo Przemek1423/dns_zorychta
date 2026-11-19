@@ -32,6 +32,11 @@ on:
           - Testowe
           - Produkcyjne
 
+      test_run_id:
+        description: 'Numer przebiegu z udanym testem TEST (wymagany dla Produkcyjne)'
+        required: false
+        type: string
+
   schedule:
     - cron: '23 2 * * 1'
 
@@ -483,3 +488,133 @@ jobs:
           }
 
           echo "Test PROD zakonczony poprawnie dla obrazu ${OBRAZ}:${TAG}."
+
+  deploy-existing:
+    name: Reczne wdrozenie istniejacego obrazu
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ inputs.target_environment == 'Testowe' && 'test_zorychta' || 'prod_zorychta' }}
+    environment: ${{ inputs.target_environment }}
+    concurrency:
+      group: ${{ inputs.target_environment == 'Testowe' && 'dns-deploy-test' || 'dns-deploy-prod' }}
+      cancel-in-progress: false
+    timeout-minutes: 15
+    env:
+      OBRAZ: ${{ vars.Login_Docker_Hub }}/dns_zorychta
+      TAG: ${{ inputs.image_tag }}
+      DNS_SERVER_IP: ${{ vars.DNS_SERVER_IP }}
+      TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+      TEST_RUN_ID: ${{ inputs.test_run_id }}
+
+    steps:
+      - name: Pobranie repozytorium
+        uses: actions/checkout@v7
+
+      - name: Walidacja danych i sprawdzenie istnienia obrazu
+        run: |
+          set -euo pipefail
+
+          test -n "${OBRAZ}" || { echo "::error::Brak nazwy obrazu."; exit 1; }
+          test -n "${TAG}" || { echo "::error::Nie podano tagu obrazu."; exit 1; }
+          test -n "${DNS_SERVER_IP}" || { echo "::error::Brak DNS_SERVER_IP w wybranym srodowisku."; exit 1; }
+
+          if [[ ! "${TAG}" =~ ^b[0-9]+-[0-9a-f]{7}$ ]]; then
+            echo "::error::Podaj unikalny tag budowania w formacie b<numer>-<7 znakow SHA>, np. b11-3f89eaa."
+            exit 1
+          fi
+
+          if [ "${TARGET_ENVIRONMENT}" = "Produkcyjne" ]; then
+            if [ -z "${TEST_RUN_ID}" ]; then
+              echo "::error::Dla PROD podaj numer przebiegu GitHub Actions, w ktorym ten obraz przeszedl testy na TEST."
+              exit 1
+            fi
+            if [[ ! "${TEST_RUN_ID}" =~ ^[0-9]+$ ]]; then
+              echo "::error::Numer przebiegu TEST musi byc liczba, np. 11."
+              exit 1
+            fi
+            echo "Potwierdzenie operatora: obraz ${OBRAZ}:${TAG} przeszedl TEST w przebiegu #${TEST_RUN_ID}."
+            echo "Automatyczna weryfikacja wskazanego przebiegu nie jest wlaczona; sprawdz jego wynik i tag obrazu przed zatwierdzeniem PROD."
+          else
+            echo "Wybrane srodowisko: TEST."
+          fi
+
+          echo "Sprawdzanie, czy obraz ${OBRAZ}:${TAG} istnieje w Docker Hub..."
+          docker pull "${OBRAZ}:${TAG}"
+          echo "Obraz istnieje i zostal pobrany. Nie wykonujemy budowania ani publikowania."
+
+      - name: Wdrozenie wskazanego obrazu przez Docker Compose
+        run: |
+          set -euo pipefail
+          echo "Wdrazenie ${OBRAZ}:${TAG} na ${TARGET_ENVIRONMENT}."
+          docker compose --project-name dns_zorychta pull
+          docker compose --project-name dns_zorychta up -d --force-recreate
+          docker compose --project-name dns_zorychta ps
+
+      - name: Test rekordow A, PTR i numeru SOA obrazu
+        run: |
+          set -euo pipefail
+
+          echo "Sprawdzanie rekordu A www.zorychta.lan..."
+          A_RESULT=""
+          for attempt in $(seq 1 10); do
+            A_RESULT="$(dig "@${DNS_SERVER_IP}" www.zorychta.lan A +short +time=2 +tries=1 || true)"
+            if [ -n "${A_RESULT}" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Wynik A: ${A_RESULT}"
+          printf '%s\n' "${A_RESULT}" | grep -Fxq '192.168.60.13' || {
+            echo "::error::Rekord A www.zorychta.lan nie wskazuje na PROD (192.168.60.13)."
+            exit 1
+          }
+
+          echo "Sprawdzanie rekordu PTR dla 192.168.60.13..."
+          PTR_RESULT=""
+          for attempt in $(seq 1 10); do
+            PTR_RESULT="$(dig "@${DNS_SERVER_IP}" -x 192.168.60.13 +short +time=2 +tries=1 | sed 's/\.$//' || true)"
+            if [ -n "${PTR_RESULT}" ]; then
+              break
+            fi
+            sleep 3
+          done
+          echo "Wynik PTR: ${PTR_RESULT}"
+          [ "${PTR_RESULT}" = 'prod.zorychta.lan' ] || {
+            echo "::error::Rekord PTR dla 192.168.60.13 nie wskazuje na prod.zorychta.lan."
+            exit 1
+          }
+
+          echo "Odczyt numeru SOA bezposrednio z pliku strefy we wdrozonym kontenerze..."
+          DEPLOYED_ZONE_FILE="$(mktemp)"
+          docker exec serwer-dns cat /etc/bind/db.zorychta.lan > "${DEPLOYED_ZONE_FILE}"
+          EXPECTED_SOA="$(python3 - "${DEPLOYED_ZONE_FILE}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          filename = Path(sys.argv[1])
+          content = filename.read_text(encoding='utf-8')
+          match = re.search(r'\bSOA\b.*?\(\s*(\d+)', content, re.IGNORECASE | re.DOTALL)
+          if not match:
+              raise SystemExit('Nie znaleziono numeru SOA w pliku strefy wdrozonego kontenera.')
+          print(match.group(1))
+          PY
+          )"
+          rm -f "${DEPLOYED_ZONE_FILE}"
+
+          ACTUAL_SOA=""
+          for attempt in $(seq 1 10); do
+            ACTUAL_SOA="$(dig "@${DNS_SERVER_IP}" zorychta.lan SOA +short +time=2 +tries=1 | awk 'NR == 1 {print $3}' || true)"
+            if [ -n "${ACTUAL_SOA}" ]; then
+              break
+            fi
+            sleep 3
+          done
+
+          echo "SOA w pliku wdrozonego obrazu: ${EXPECTED_SOA}"
+          echo "SOA odczytany z serwera DNS:   ${ACTUAL_SOA}"
+          [ "${ACTUAL_SOA}" = "${EXPECTED_SOA}" ] || {
+            echo "::error::Numer SOA w dzialajacym DNS nie zgadza sie z plikiem strefy wdrozonego obrazu."
+            exit 1
+          }
+
+          echo "Reczne wdrozenie i testy zakonczone poprawnie: ${OBRAZ}:${TAG} na ${TARGET_ENVIRONMENT}."
